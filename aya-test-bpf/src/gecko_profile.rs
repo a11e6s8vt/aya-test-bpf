@@ -52,7 +52,7 @@ impl ProfileBuilder {
             name: name.to_string(),
             path: path.to_string(),
             arch,
-            breakpad_id: format!("{:X}0", uuid.to_simple()),
+            breakpad_id: format!("{:X}0", uuid.simple()),
             start_address: address_range.start,
             end_address: address_range.end,
         })
@@ -230,6 +230,7 @@ impl ThreadBuilder {
     }
 
     fn frame_index_for_address(&mut self, address: u64) -> usize {
+        println!("address = {}", address);
         self.frame_table
             .index_for_frame(&mut self.string_table, address)
     }

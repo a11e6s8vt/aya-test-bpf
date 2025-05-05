@@ -1,27 +1,48 @@
 [package]
 name = "aya-test-bpf"
 version = "0.1.0"
-edition = "2018"
-publish = false
+edition = "2021"
 
 [dependencies]
-aya = { path = "../../aya/aya", features = ["async_tokio"] }
-aya-test-bpf-common = { path = "../aya-test-bpf-common", features=["userspace"] }
-anyhow = "1.0.42"
-bytes = "1"
-tokio = { version = "1.9.0", features = ["full"] }
-futures = "0.3.16"
-serde_json = "1.0.53"
-uuid = "0.8.1"
-itertools = "0.10.1"
-libc = "0.2.99"
-# proc-maps = "0.1.9" # resolve conflict with xtask -> aya-gen -> bindgen first
-memmap2 = "0.3.0"
+aya-test-bpf-common = { path = "../aya-test-bpf-common", features = ["user"] }
 
-[dependencies.object]
-default-features = false
-features = ["std", "read_core", "elf", "unaligned"]
-version = "0.26.0"
+anyhow = { workspace = true, default-features = true }
+aya = { workspace = true }
+aya-log = { workspace = true }
+addr2line = { workspace = true }
+blazesym = { workspace = true }
+bytes = { workspace = true }
+env_logger = { workspace = true }
+futures = { workspace = true }
+itertools = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+memmap2 = { workspace = true }
+object = { workspace = true, features = ["std", "read_core", "elf", "unaligned"] } 
+proc-maps = { workspace = true }
+procfs = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+uuid = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+aya-build = { workspace = true }
+# TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
+# it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build
+# script to build this, but we want to teach cargo about the dependecy so that cache invalidation
+# works properly.
+#
+# Note also that https://github.com/rust-lang/cargo/issues/10593 occurs when `target = ...` is added
+# to an artifact dependency; it seems possible to work around that by setting `resolver = "1"` in
+# Cargo.toml in the workspace root.
+#
+# Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
+# workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
+# features.
+aya-test-bpf-ebpf = { path = "../aya-test-bpf-ebpf" }
 
 [[bin]]
 name = "aya-test-bpf"

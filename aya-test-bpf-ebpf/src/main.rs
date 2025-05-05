@@ -7,16 +7,16 @@
 #[allow(non_snake_case)]
 mod bindings;
 
-use aya_bpf::bindings::BPF_F_USER_STACK;
-use aya_bpf::helpers::{
+use aya_ebpf::bindings::BPF_F_USER_STACK;
+use aya_ebpf::helpers::{
     bpf_get_current_comm, bpf_get_current_task_btf, bpf_ktime_get_ns, bpf_probe_read,
 };
-use aya_bpf::macros::map;
-use aya_bpf::macros::{kprobe, perf_event, tracepoint};
-use aya_bpf::maps::{HashMap, PerfMap, StackTrace};
-use aya_bpf::programs::{PerfEventContext, ProbeContext, TracePointContext};
-use aya_bpf::BpfContext;
-use aya_test_bpf_common::{Sample, LogEvent};
+use aya_ebpf::macros::map;
+use aya_ebpf::macros::{kprobe, perf_event, tracepoint};
+use aya_ebpf::maps::{HashMap, PerfEventArray, StackTrace};
+use aya_ebpf::programs::{PerfEventContext, ProbeContext, TracePointContext};
+use aya_ebpf::EbpfContext;
+use aya_test_bpf_common::{LogEvent, Sample};
 use bindings::{
     bpf_perf_event_data, pid_t, pt_regs, task_struct, thread_struct, trace_event_raw_sched_switch,
 };
@@ -37,10 +37,10 @@ struct ThreadTimingData {
 }
 
 #[map(name = "EVENTS")]
-static mut EVENTS: PerfMap<LogEvent> = PerfMap::<LogEvent>::with_max_entries(1024, 0);
+static mut EVENTS: PerfEventArray<LogEvent> = PerfEventArray::<LogEvent>::new(0);
 
 #[map(name = "SAMPLES")]
-static mut SAMPLES: PerfMap<Sample> = PerfMap::<Sample>::with_max_entries(1024, 0);
+static mut SAMPLES: PerfEventArray<Sample> = PerfEventArray::<Sample>::new(0);
 
 #[map(name = "STACKS")]
 static mut STACKS: StackTrace = StackTrace::with_max_entries(102400, 0);
@@ -76,11 +76,11 @@ fn set_thread_timing(pid: i32, timing: &ThreadTimingData) {
 
 #[inline(always)]
 fn thread_goes_on(
-    ctx: &impl BpfContext,
+    ctx: &impl EbpfContext,
     pid: i32,
     tgid: i32,
     now: u64,
-    comm: &[::aya_bpf_cty::c_char; 16usize],
+    comm: &[::aya_ebpf::cty::c_char; 16usize],
 ) {
     let mut timing = get_thread_timing(pid, now, false);
     let sleep_time: u64 = now - timing.last_seen_ts;
@@ -107,7 +107,7 @@ fn thread_goes_on(
 }
 
 #[inline(always)]
-fn thread_goes_off(ctx: &impl BpfContext, pid: i32, _tgid: i32, now: u64) {
+fn thread_goes_off(ctx: &impl EbpfContext, pid: i32, _tgid: i32, now: u64) {
     let mut timing = get_thread_timing(pid, now, true);
     let on_cpu_time_delta = now - timing.last_seen_ts;
     timing.cpu_delta_since_last_sample_ns += on_cpu_time_delta;
@@ -123,11 +123,11 @@ fn thread_goes_off(ctx: &impl BpfContext, pid: i32, _tgid: i32, now: u64) {
 
 #[inline(always)]
 fn thread_gets_sampled_while_on(
-    ctx: &impl BpfContext,
+    ctx: &impl EbpfContext,
     pid: i32,
     tgid: i32,
     now: u64,
-    comm: &[::aya_bpf_cty::c_char; 16usize],
+    comm: &[::aya_ebpf::cty::c_char; 16usize],
 ) {
     let mut timing = get_thread_timing(pid, now, true);
     if timing.active == 0 {
@@ -155,7 +155,7 @@ fn thread_gets_sampled_while_on(
     set_thread_timing(pid, &timing);
 }
 
-#[tracepoint(name = "sched_switch")]
+#[tracepoint]
 pub fn sched_switch(ctx: TracePointContext) -> u32 {
     match unsafe { try_sched_switch(ctx) } {
         Ok(ret) => ret,
@@ -194,7 +194,7 @@ pub unsafe fn try_sched_switch(ctx: TracePointContext) -> Result<u32, i64> {
         let next_comm = bpf_probe_read(
             ctx.as_ptr()
                 .offset(offset_of!(trace_event_raw_sched_switch, next_comm) as isize)
-                as *const [::aya_bpf_cty::c_char; 16usize],
+                as *const [::aya_ebpf::cty::c_char; 16usize],
         )?;
         let next_comm = [0; 16];
         let next_tgid = 0; // TODO
@@ -215,7 +215,7 @@ pub unsafe fn try_sched_switch(ctx: TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
-#[perf_event(name = "cpu_clock")]
+#[perf_event]
 pub fn cpu_clock(ctx: PerfEventContext) -> u32 {
     if ctx.pid() == 0 {
         return 0;
@@ -223,7 +223,7 @@ pub fn cpu_clock(ctx: PerfEventContext) -> u32 {
 
     let now = unsafe { bpf_ktime_get_ns() };
     let comm = match bpf_get_current_comm() {
-        Ok(comm) => comm,
+        Ok(comm) => unsafe { core::mem::transmute(comm) },
         Err(_) => return 0,
     };
     thread_gets_sampled_while_on(&ctx, ctx.pid() as i32, ctx.tgid() as i32, now, &comm);
@@ -249,7 +249,7 @@ pub fn cpu_clock(ctx: PerfEventContext) -> u32 {
     0
 }
 
-#[kprobe(name = "finish_task_switch")]
+#[kprobe]
 pub fn finish_task_switch(ctx: ProbeContext) -> u32 {
     match unsafe { try_finish_task_switch(ctx) } {
         Ok(ret) => ret,

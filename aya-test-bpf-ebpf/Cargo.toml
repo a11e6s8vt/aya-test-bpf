@@ -1,24 +1,21 @@
 [package]
 name = "aya-test-bpf-ebpf"
 version = "0.1.0"
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-aya-bpf = { path = "../../aya/bpf/aya-bpf" }
 aya-test-bpf-common = { path = "../aya-test-bpf-common" }
-aya-bpf-cty = { path = "../../aya/bpf/aya-bpf-cty" }
-memoffset = "0.6"
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+memoffset = { workspace = true }
+
+[build-dependencies]
+cc = "1.2.20"
+bindgen = "0.71.1"
+which = { workspace = true }
+aya-tool = { git = "https://github.com/aya-rs/aya" }
 
 [[bin]]
 name = "aya-test-bpf"
 path = "src/main.rs"
-
-[profile.dev]
-panic = "abort"
-overflow-checks = false
-
-[profile.release]
-panic = "abort"
-
-[workspace]
-members = []

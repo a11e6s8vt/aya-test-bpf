@@ -1,6 +1,7 @@
 #![no_std]
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LogEvent {
     pub tag: u64,
     pub field: u64,
@@ -10,6 +11,7 @@ pub struct LogEvent {
 unsafe impl aya::Pod for LogEvent {}
 
 #[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub timestamp: u64,
     pub cpu_delta: u64,

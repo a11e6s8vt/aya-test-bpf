@@ -1,15 +1,19 @@
 use aya::{
     maps::{
         perf::{AsyncPerfEventArray, PerfBufferError},
-        MapRefMut, StackTraceMap,
+        HashMap as AyaMap, MapData, StackTraceMap,
     },
-    programs::{KProbe, PerfEvent, PerfEventScope, SamplePolicy, TracePoint},
+    programs::{
+        perf_event, FEntry, KProbe, PerfEvent, PerfEventScope, RawTracePoint, SamplePolicy,
+        TracePoint,
+    },
     util::online_cpus,
-    Bpf,
+    Ebpf,
 };
 use bytes::BytesMut;
 use gecko_profile::{ProfileBuilder, ThreadBuilder};
 use itertools::Itertools;
+use log::{debug, warn};
 use object::{Object, ObjectSection, SectionKind};
 use proc_maps::MapRange;
 use serde_json::to_writer;
@@ -23,11 +27,12 @@ use std::{
     io::BufWriter,
     ops::Range,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{
     select, signal,
-    sync::{mpsc, watch},
+    sync::{mpsc, watch, Mutex},
     task::{self, JoinHandle},
 };
 use uuid::Uuid;
@@ -53,29 +58,50 @@ struct Sample2 {
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
-    let path = match env::args().nth(1) {
-        Some(iface) => iface,
-        None => panic!("not path provided"),
-    };
+    env_logger::init();
 
-    let data = fs::read(path)?;
-    let mut bpf = Bpf::load(&data, None)?;
-    for program in bpf.programs() {
-        println!(
-            "found program `{}` of type `{:?}`",
-            program.name(),
-            program.prog_type()
-        );
+    // Bump the memlock rlimit. This is needed for older kernels that don't use the
+    // new memcg based accounting, see https://lwn.net/Articles/837122/
+    let rlim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    let ret = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+    if ret != 0 {
+        debug!("remove limit on locked memory failed, ret is: {}", ret);
     }
 
+    // This will include your eBPF object file as raw bytes at compile-time and load it at
+    // runtime. This approach is recommended for most real-world use cases. If you would
+    // like to specify the eBPF program at runtime rather than at compile-time, you can
+    // reach for `Bpf::load_file` instead.
+    let mut ebpf = Arc::new(Mutex::new(aya::Ebpf::load(aya::include_bytes_aligned!(
+        concat!(env!("OUT_DIR"), "/aya-test-bpf")
+    ))?));
+
+    let mut ebpf1 = ebpf.clone();
+    let mut ebpf_guard = ebpf.lock().await;
+
+    if let Err(e) = aya_log::EbpfLogger::init(&mut ebpf_guard) {
+        // This can happen if you remove all log statements from your eBPF program.
+        warn!("failed to initialize eBPF logger: {}", e);
+    }
     let start_time = Instant::now();
     let start_timestamp_ns = get_timestamp_ns();
 
-    let tp: &mut TracePoint = bpf.program_mut("sched_switch")?.try_into()?;
+    let tp: &mut TracePoint = ebpf_guard
+        .program_mut("sched_switch")
+        .unwrap()
+        .try_into()
+        .unwrap();
     tp.load()?;
     tp.attach("sched", "sched_switch")?;
 
-    let kprobe: &mut KProbe = bpf.program_mut("finish_task_switch")?.try_into()?;
+    let kprobe: &mut KProbe = ebpf_guard
+        .program_mut("finish_task_switch")
+        .unwrap()
+        .try_into()
+        .unwrap();
     kprobe.load()?;
     match kprobe.attach("finish_task_switch", 0) {
         Ok(_) => (),
@@ -84,23 +110,28 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    let perf_event: &mut PerfEvent = bpf.program_mut("cpu_clock")?.try_into()?;
+    let perf_event: &mut PerfEvent = ebpf_guard
+        .program_mut("cpu_clock")
+        .unwrap()
+        .try_into()
+        .unwrap();
     perf_event.load()?;
 
     const SAMPLE_PERIOD: u64 = 1000000;
 
-    for cpu_id in online_cpus()? {
+    for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         perf_event.attach(
-            1, /* PERF_TYPE_SOFTWARE */
-            0, /* PERF_COUNT_SW_CPU_CLOCK */
-            PerfEventScope::AllProcessesOneCpu { cpu: cpu_id },
-            SamplePolicy::Period(SAMPLE_PERIOD),
+            perf_event::PerfTypeId::Software,
+            perf_event::perf_sw_ids::PERF_COUNT_SW_CPU_CLOCK as u64,
+            perf_event::PerfEventScope::AllProcessesOneCpu { cpu: cpu_id },
+            perf_event::SamplePolicy::Period(SAMPLE_PERIOD),
+            true,
         )?;
     }
 
-    let mut perf_array = AsyncPerfEventArray::try_from(bpf.map_mut("SAMPLES")?)?;
-    let mut log_perf_array = AsyncPerfEventArray::try_from(bpf.map_mut("EVENTS")?)?;
-    let stacks = StackTraceMap::try_from(bpf.map_mut("STACKS")?)?;
+    let mut perf_array = AsyncPerfEventArray::try_from(ebpf_guard.take_map("SAMPLES").unwrap())?;
+    let mut log_perf_array = AsyncPerfEventArray::try_from(ebpf_guard.take_map("EVENTS").unwrap())?;
+    let stacks = StackTraceMap::try_from(ebpf_guard.take_map("STACKS").unwrap())?;
 
     let (tx_pids, mut rx_pids) = mpsc::channel(32);
     let (termination_signal_sender, rx) = watch::channel(false);
@@ -135,7 +166,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let mut join_handles = Vec::new();
 
-    for cpu_id in online_cpus()? {
+    for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         // TODO: would more than 2 pages in the perf array buffer be better?
         let mut buf = perf_array.open(cpu_id, Some(2))?;
         let mut rx = rx.clone();
@@ -242,7 +273,7 @@ async fn main() -> Result<(), anyhow::Error> {
         join_handles.push(task);
     }
 
-    for cpu_id in online_cpus()? {
+    for cpu_id in online_cpus().map_err(|(_, error)| error)? {
         let mut buf = log_perf_array.open(cpu_id, Some(2))?;
         let mut rx = rx.clone();
         let _: JoinHandle<Result<_, PerfBufferError>> = task::spawn(async move {
@@ -278,7 +309,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     signal::ctrl_c().await.expect("failed to listen for event");
     eprintln!("ctrl c has arrived");
-    drop(bpf);
+    drop(ebpf_guard);
     eprintln!("bpf is dropped");
     termination_signal_sender.send(true)?;
     eprintln!("termination signal has been sent");
@@ -355,7 +386,7 @@ fn save_to_profile(
     start_time: Instant,
     start_timestamp_ns: u64,
     threads: Vec<Thread>,
-    stacks: &StackTraceMap<MapRefMut>,
+    stacks: &StackTraceMap<MapData>,
     proc_maps_by_pid: HashMap<i32, Vec<MapRange>>,
 ) {
     let mut root_profile_builder =
@@ -404,7 +435,7 @@ fn add_threads_to_profile(
     _process_start_time: &Instant,
     process_start_timestamp_ns: u64,
     threads: Vec<Thread>,
-    stacks: &StackTraceMap<MapRefMut>,
+    stacks: &StackTraceMap<MapData>,
 ) {
     for thread in threads {
         profile_builder.add_thread(make_profile_thread(
@@ -426,7 +457,7 @@ fn get_timestamp_ns() -> u64 {
 
 fn make_profile_thread(
     thread: Thread,
-    stacks: &StackTraceMap<MapRefMut>,
+    stacks: &StackTraceMap<MapData>,
     start_timestamp_ns: u64,
 ) -> ThreadBuilder {
     let mut thread_builder = ThreadBuilder::new(
@@ -561,7 +592,7 @@ fn create_elf_id(identifier: &[u8], little_endian: bool) -> Uuid {
 /// processor does.
 ///
 /// If all of the above fails, this function will return `None`.
-pub fn get_elf_id<'data: 'file, 'file>(elf_file: &'file impl Object<'data, 'file>) -> Option<Uuid> {
+pub fn get_elf_id<'data: 'file, 'file>(elf_file: &'file impl Object<'data>) -> Option<Uuid> {
     if let Some(identifier) = elf_file.build_id().ok()? {
         return Some(create_elf_id(identifier, elf_file.is_little_endian()));
     }
@@ -582,9 +613,7 @@ pub fn get_elf_id<'data: 'file, 'file>(elf_file: &'file impl Object<'data, 'file
 }
 
 /// Returns a reference to the data of the the .text section in an ELF binary.
-fn find_text_section<'data: 'file, 'file>(
-    file: &'file impl Object<'data, 'file>,
-) -> Option<&'data [u8]> {
+fn find_text_section<'data: 'file, 'file>(file: &'file impl Object<'data>) -> Option<&'data [u8]> {
     file.sections()
         .find(|header| header.kind() == SectionKind::Text)
         .and_then(|header| header.data().ok())
